@@ -1,92 +1,68 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <stdio.h>
-#include <glib.h>
+#include <stdlib.h>
 
 #include "events.h"
 #include "tiramisu.h"
 #include "notification.h"
 
-unsigned int id = 0;
+/* GDBus dispatched every method call on the GMainContext thread; the pipe
+ * server calls us from one thread per client, so the id counter and stdout
+ * need a lock. */
+static CRITICAL_SECTION lock;
+static unsigned int id = 0;
+wn_server *server = NULL;
 
-void event_handler(GDBusConnection *connection, const gchar *sender,
-    const gchar *object, const gchar *interface, const gchar*label,
-    GVariant *parameters, GDBusMethodInvocation *invocation,
-    gpointer data) {
+void events_init(void) {
+    InitializeCriticalSection(&lock);
+}
 
-    GVariant *return_value = NULL;
+void event_handler(wn_conn *connection, char **fields, size_t n_fields, void *data) {
+    (void)data;
+    const char *label = fields[0];
 
-    if (!strcmp(label, "GetServerInformation"))
-        return_value = g_variant_new("(ssss)", "tiramisu", "Sweets", "1.1", "1.2");
-    else if (!strcmp(label, "NotificationClosed")) {
-        // id
-        // reason
-    } else if (!strcmp(label, "CloseNotification")) {
-        // id
+    if (!strcmp(label, "GetServerInformation")) {
+        wn_reply(connection, "OK\ttiramisu\tSweets\t" TIRAMISU_VERSION "\t" WN_SPEC_VERSION);
     } else if (!strcmp(label, "GetCapabilities")) {
-
-        GVariantBuilder *builder;
-        builder = g_variant_builder_new(G_VARIANT_TYPE("as"));
-
-        g_variant_builder_add(builder, "s", "body");
-        g_variant_builder_add(builder, "s", "actions");
-        g_variant_builder_add(builder, "s", "icon-static");
-
-        return_value = g_variant_new("(as)", builder);
-
+        wn_reply(connection, "OK\tbody\tactions\ticon-static");
+    } else if (!strcmp(label, "CloseNotification")) {
+        /* Nothing is on screen, but the spec says the server must emit
+         * NotificationClosed(id, 3); clients like `notify-send -w` wait for it. */
+        unsigned long closed = n_fields > 1 ? strtoul(fields[1], NULL, 10) : 0;
+        wn_reply_ok(connection);
+        wn_emit_closed(server, (uint32_t)closed, WN_CLOSE_CLOSED);
     } else if (!strcmp(label, "Notify")) {
+        wn_notify raw;
+        if (wn_parse_notify(fields, n_fields, &raw)) {
+            wn_reply_err(connection, "malformed Notify");
+            return;
+        }
+
+        EnterCriticalSection(&lock);
+        /* 1.x/2.x C: always ++id (ignored replaces_id).
+         * Vala: honours replaces_id. We keep the Vala semantics. */
+        unsigned int assigned = raw.replaces_id ? raw.replaces_id : ++id;
 
         notification_t notification;
-        hydrate_notification(&notification, parameters);
+        hydrate_notification(&notification, &raw, assigned);
 
-        char *output = strdup(output_format);
+        char *output = _strdup(output_format);
         interpolate_output_string(&output, notification);
-        printf("%s\n", output);
-        fflush(stdout);
+        fwrite(output, 1, strlen(output), stdout);
+        fputc('\n', stdout);
+        fflush(stdout); /* "vital" (commit 3cbe502) */
+        LeaveCriticalSection(&lock);
 
         free(output);
+        free_notification(&notification);
+        wn_notify_free(&raw);
 
-        return_value = g_variant_new("(u)", ++id);
-    } else if (!strcmp(label, "ActionInvoked")) {
-        // id
-        // action key
-        /* Implementation idea:
-         * Passing anything to STDIN for another tiramisu call will have that process find the actual running daemon
-         * So that the message can be invoked and sent to dbus
-         *
-         * e.g. echo "Clicked" | tiramisu
-         */
-    } else
-        printf("Unhandled(%s, %s)", sender, label);
-
-    g_dbus_method_invocation_return_value(invocation, return_value);
-    g_dbus_connection_flush(connection, NULL, NULL, NULL);
-}
-
-void bus_acquired(GDBusConnection *connection, const gchar *name, gpointer data) {
-    const gchar *object_path = "/org/freedesktop/Notifications";
-    GDBusInterfaceInfo *interface_info = introspection->interfaces[0];
-    const GDBusInterfaceVTable *interface_vtable = &(const GDBusInterfaceVTable){
-        event_handler
-    };
-
-    guint registered_object;
-    registered_object = g_dbus_connection_register_object(connection,
-        object_path, interface_info, interface_vtable, NULL, NULL, NULL);
-
-    if (registered_object)
-        return;
-
-    printf("%s\n", "bus not acquired; unable to register object path");
-    stop_main_loop(NULL);
-}
-
-void name_acquired(GDBusConnection *connection, const gchar *name, gpointer data) {
-    dbus_connection = connection;
-}
-
-void name_lost(GDBusConnection *connection, const gchar *name, gpointer data) {
-    if (connection)
-        return;
-
-    printf("%s\n", "bus not acquired; could not connect to dbus");
-    stop_main_loop(NULL);
+        char reply[32];
+        snprintf(reply, sizeof reply, "OK\t%u", assigned);
+        wn_reply(connection, reply);
+    } else {
+        print("Unhandled(%s)", label);
+        wn_reply_err(connection, "unknown method");
+    }
 }

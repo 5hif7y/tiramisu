@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(tiramisu C)
+set(CMAKE_C_STANDARD 11)
+add_executable(tiramisu src/tiramisu.c src/events.c src/notification.c src/wnotify.c)
+target_compile_definitions(tiramisu PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_compile_options(tiramisu PRIVATE $<$<C_COMPILER_ID:MSVC>:/W4 /utf-8>)

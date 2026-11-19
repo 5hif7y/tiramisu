@@ -1,82 +1,158 @@
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <signal.h>
-#include <unistd.h>
-
-#include <gio/gio.h>
-#include <glib.h>
-#include <glib-unix.h>
 
 #include "tiramisu.h"
 #include "notification.h"
 #include "events.h"
 
-GDBusConnection *dbus_connection = NULL;
-GDBusNodeInfo *introspection = NULL;
-GMainLoop *main_loop = NULL;
+/* POSIX -> Win32:
+ *   GMainLoop + g_unix_signal_add(SIGINT/SIGTERM)  -> stop event + SetConsoleCtrlHandler
+ *   g_bus_own_name(SESSION, org.freedesktop.Notifications)
+ *                                                  -> wn_server_start (named pipe, first instance)
+ *   getopt("hsjo:")                                -> small parser below (no getopt in the MSVC CRT),
+ *                                                     long options from the Vala version added
+ */
 
 char *output_format;
 int sanitize_output = 0;
+int json_output = 0;
 
-gboolean stop_main_loop(gpointer user_data) {
-    g_main_loop_quit(main_loop);
+static HANDLE main_loop; /* manual-reset event standing in for GMainLoop */
 
-    return G_SOURCE_CONTINUE;
+void stop_main_loop(void) {
+    SetEvent(main_loop);
 }
 
-int main(int argc, char **argv) {
-    /* Parse arguments */
+static BOOL WINAPI console_handler(DWORD type) {
+    (void)type; /* Ctrl+C, Ctrl+Break, console closed, logoff, shutdown */
+    stop_main_loop();
+    return TRUE;
+}
 
-    char argument;
-    while ((argument = getopt(argc, argv, "hsjo:")) >= 0) {
-        switch (argument) {
-            case 'h':
-                printf("%s\n",
-                    "tiramisu -[h|o]\n"
-                    "-h\tHelp dialog\n"
-                    "-s\tSanitize output (for outputs that use quotes, e.g. JSON)\n"
-                    "-j\tOutput to JSON (implies `-s`)."
-                    "-o\tOutput formatting\n");
-                return EXIT_SUCCESS;
-                break;
-            case 's':
-                sanitize_output = 1;
-                break;
-            case 'j':
-                sanitize_output = 1;
-                output_format = JSON_OUTPUT_FORMAT;
-                break;
-            case 'o':
-                output_format = strdup(optarg);
-                break;
-            default:
-                break;
+static void usage(FILE *out) {
+    fprintf(out, "%s\n",
+        "tiramisu -[h|s|j|o FORMAT|d DELIM]\n"
+        "-h, --help            Help dialog\n"
+        "-s, --sanitize        Sanitize output (escape quotes, backslashes, control chars)\n"
+        "-j, --json            Output to JSON (implies `-s`)\n"
+        "-o, --format FORMAT   Output formatting; keys: #source #icon #id #summary\n"
+        "                      #body #actions #hints #timeout\n"
+        "-d, --delimiter DELIM Separator for the default format (default: newline)");
+}
+
+static char *build_default_format(const char *delimiter) {
+    const char *fields[] = DEFAULT_OUTPUT_FIELDS;
+    size_t count = sizeof fields / sizeof fields[0], size = 1;
+    for (size_t i = 0; i < count; i++)
+        size += strlen(fields[i]) + strlen(delimiter);
+    char *out = calloc(size, 1);
+    for (size_t i = 0; i < count; i++) {
+        if (i)
+            strcat(out, delimiter);
+        strcat(out, fields[i]);
+    }
+    return out;
+}
+
+/* Accepts -o FMT, -oFMT, --format FMT, --format=FMT, and grouped flags (-sj). */
+static const char *take_value(int argc, char **argv, int *i, const char *arg, size_t prefix) {
+    if (arg[prefix] == '=')
+        return arg + prefix + 1;
+    if (arg[prefix])
+        return arg + prefix;
+    if (*i + 1 < argc)
+        return argv[++*i];
+    fprintf(stderr, "tiramisu: option %s requires a value\n", arg);
+    exit(EXIT_FAILURE);
+}
+
+int wmain(int argc, wchar_t **wargv) {
+    char **argv = calloc(argc + 1, sizeof *argv);
+    for (int i = 0; i < argc; i++)
+        argv[i] = wn_utf8(wargv[i]);
+
+    const char *delimiter = "\n";
+
+    /* Parse arguments */
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (!strcmp(arg, "--help")) {
+            usage(stdout);
+            return EXIT_SUCCESS;
+        } else if (!strcmp(arg, "--sanitize")) {
+            sanitize_output = 1;
+        } else if (!strcmp(arg, "--json")) {
+            json_output = 1;
+        } else if (!strncmp(arg, "--format", 8) && (!arg[8] || arg[8] == '=')) {
+            output_format = _strdup(take_value(argc, argv, &i, arg, 8));
+        } else if (!strncmp(arg, "--delimiter", 11) && (!arg[11] || arg[11] == '=')) {
+            delimiter = take_value(argc, argv, &i, arg, 11);
+        } else if (arg[0] == '-' && arg[1] && arg[1] != '-') {
+            for (size_t k = 1; arg[k]; k++) {
+                switch (arg[k]) {
+                    case 'h':
+                        usage(stdout);
+                        return EXIT_SUCCESS;
+                    case 's':
+                        sanitize_output = 1;
+                        break;
+                    case 'j':
+                        json_output = 1;
+                        break;
+                    case 'o':
+                        output_format = _strdup(take_value(argc, argv, &i, arg, k + 1));
+                        goto next;
+                    case 'd':
+                        delimiter = take_value(argc, argv, &i, arg, k + 1);
+                        goto next;
+                    default:
+                        fprintf(stderr, "tiramisu: unknown option -%c\n", arg[k]);
+                        usage(stderr);
+                        return EXIT_FAILURE;
+                }
+            }
+        } else {
+            fprintf(stderr, "tiramisu: unexpected argument %s\n", arg);
+            usage(stderr);
+            return EXIT_FAILURE;
         }
+    next:;
     }
 
+    if (json_output) {
+        sanitize_output = 1;
+        if (!output_format)
+            output_format = JSON_OUTPUT_FORMAT;
+    }
     if (!output_format)
-        output_format = DEFAULT_OUTPUT_FORMAT;
+        output_format = build_default_format(delimiter);
 
-    guint owner_id;
-    gchar *bus_name = "org.freedesktop.Notifications";
-    introspection = g_dbus_node_info_new_for_xml(INTROSPECTION_XML, NULL);
+    /* Byte-exact UTF-8 on stdout: no CRLF translation, so pipelines see the
+     * same bytes as on Linux (porter-guide module 03). */
+    _setmode(_fileno(stdout), _O_BINARY);
+    SetConsoleOutputCP(CP_UTF8);
 
-    owner_id = g_bus_own_name(G_BUS_TYPE_SESSION, bus_name, G_BUS_NAME_OWNER_FLAGS_NONE,
-        bus_acquired, name_acquired, name_lost, NULL, NULL);
-    main_loop = g_main_loop_new(NULL, FALSE);
+    main_loop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    SetConsoleCtrlHandler(console_handler, TRUE);
+    events_init();
 
-    guint signal_term = g_unix_signal_add(SIGTERM, stop_main_loop, NULL);
-    guint signal_int = g_unix_signal_add(SIGINT, stop_main_loop, NULL);
+    char error[512];
+    server = wn_server_start(event_handler, NULL, error, sizeof error);
+    if (!server) {
+        /* name_lost() */
+        fprintf(stderr, "%s\n", "bus not acquired; could not own the notifications pipe");
+        fprintf(stderr, "%s\n", error);
+        return EXIT_FAILURE;
+    }
 
-    g_main_loop_run(main_loop);
+    WaitForSingleObject(main_loop, INFINITE);
 
-    g_source_remove(signal_term);
-    g_source_remove(signal_int);
-
-    g_clear_pointer(&main_loop, g_main_loop_unref);
-    g_clear_pointer(&introspection, g_dbus_node_info_unref);
-
-    g_bus_unown_name(owner_id);
+    wn_server_stop(server);
+    CloseHandle(main_loop);
     return EXIT_SUCCESS;
 }
-
