@@ -413,6 +413,14 @@ static bool conn_write_line(wn_conn *c, const char *line)
 }
 
 void wn_reply(wn_conn *c, const char *line) { conn_write_line(c, line); }
+
+unsigned long wn_conn_client_pid(wn_conn *c)
+{
+	ULONG pid = 0;
+	if (!GetNamedPipeClientProcessId(c->pipe, &pid))
+		return 0;
+	return pid;
+}
 void wn_reply_ok(wn_conn *c) { conn_write_line(c, "OK"); }
 
 void wn_reply_err(wn_conn *c, const char *msg)
@@ -640,6 +648,11 @@ wn_client *wn_client_open(unsigned timeout_ms)
 {
 	wchar_t name[256];
 	wn_pipe_name(name, 256);
+	return wn_client_open_name(name, timeout_ms);
+}
+
+wn_client *wn_client_open_name(const wchar_t *name, unsigned timeout_ms)
+{
 	ULONGLONG deadline = GetTickCount64() + timeout_ms;
 	for (;;) {
 		HANDLE h = CreateFileW(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);

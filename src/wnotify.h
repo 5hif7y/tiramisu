@@ -89,6 +89,9 @@ typedef void (*wn_request_fn)(wn_conn *c, char **fields, size_t nf, void *ud);
 wn_server *wn_server_start(wn_request_fn fn, void *ud, char *err, size_t errcap);
 void wn_reply(wn_conn *c, const char *line);  /* line without '\n' */
 void wn_reply_ok(wn_conn *c);
+/* PID of the process on the other end (GetNamedPipeClientProcessId), 0 if
+ * unknown. D-Bus hands the daemon the sender's unique name; this is ours. */
+unsigned long wn_conn_client_pid(wn_conn *c);
 void wn_reply_err(wn_conn *c, const char *msg);
 /* Broadcast a signal line to every subscriber (thread-safe). */
 void wn_server_emit(wn_server *s, const char *line);
@@ -101,6 +104,8 @@ void wn_server_stop(wn_server *s);
 typedef struct wn_client wn_client;
 /* Waits up to timeout_ms for a server instance. NULL if no daemon. */
 wn_client *wn_client_open(unsigned timeout_ms);
+/* Same, for an explicit pipe (e.g. a downstream daemon when chaining). */
+wn_client *wn_client_open_name(const wchar_t *pipe_name, unsigned timeout_ms);
 bool wn_client_send(wn_client *c, const char *line);
 char *wn_client_read_line(wn_client *c); /* malloc'd, NULL on EOF */
 char *wn_client_call(wn_client *c, const char *line); /* send + read reply */
